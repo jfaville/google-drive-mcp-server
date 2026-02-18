@@ -1,0 +1,71 @@
+<!--
+  MCP Evaluation Suite for Google Drive MCP Server
+
+  Test data is stored in Google Drive under the folder "mcp-eval-data" (read-only from the
+  evaluator's perspective). Structure:
+    mcp-eval-data/
+      finance/
+        budget_2023.txt   (Year: 2023, Q1-Q4 all non-zero, Total: 2060000)
+        budget_2024.txt   (Year: 2024, Q1: 490000, Q2-Q4: 0, Total: 490000)
+      people/
+        team_roster.txt   (4 members with join dates)
+      project_atlas.txt   (Status: Completed, Lead: Alice Chen, Budget: 850000)
+      project_beacon.txt  (Status: Active, Lead: Bob Kumar, Budget: 620000)
+      glossary.txt        (defines OKR, NPS, FY, ROI; Current NPS: 67)
+
+  To run (HTTP transport, server already running at localhost:3000):
+    pip install -r scripts/requirements.txt
+    export ANTHROPIC_API_KEY=your_key
+    python scripts/evaluation.py -t http -u http://localhost:3000/mcp evaluation.xml -o eval_report.md
+-->
+<evaluation>
+  <qa_pair>
+    <question>In the evaluation dataset folder, locate the subfolder that holds financial planning documents. Among the budget files stored there, which year had all four quarters funded with non-zero amounts? What was that year's documented total budget figure?</question>
+    <answer>2060000</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>Find the subfolder in the evaluation dataset that contains personnel information. A roster file inside it lists team members with their join dates. How many team members joined the company before the year 2021?</question>
+    <answer>2</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>One project file in the top-level evaluation folder describes a completed infrastructure effort involving migration to the cloud. Who was designated as lead for that project?</question>
+    <answer>Alice Chen</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>A glossary file in the evaluation dataset defines several business abbreviations. One entry includes a current measured value alongside the abbreviation's definition. What is that current measured value?</question>
+    <answer>67</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>Among the project files stored directly in the top-level evaluation folder, one describes an active customer-facing redesign initiative. What is the budget amount allocated to that project?</question>
+    <answer>620000</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>How many text files (not folders) are stored directly inside the folder named "mcp-eval-data"? Do not count files in subfolders.</question>
+    <answer>3</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>According to the personnel roster in the evaluation dataset, what is the join date of the team member with the longest tenure? Answer in YYYY-MM-DD format.</question>
+    <answer>2019-05-20</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>Add together the total annual budget figures from all years documented in the finance subfolder of the evaluation dataset. What is their combined sum?</question>
+    <answer>2550000</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>The completed project in the evaluation dataset has an explicit end date recorded in its file. What is that end date? Answer in YYYY-MM-DD format.</question>
+    <answer>2023-08-31</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>What is the name of the subfolder inside "mcp-eval-data" that contains only files related to financial planning? Answer with the exact folder name.</question>
+    <answer>finance</answer>
+  </qa_pair>
+</evaluation>
