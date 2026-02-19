@@ -907,7 +907,7 @@ async function runHTTP() {
   app.use(express.json());
 
   // Landing page / Picker page (combined)
-  app.get('/', (req, res) => {
+  app.get('/', async (req, res) => {
     const isAuthenticated = driveService.isAuthenticated();
 
     if (!isAuthenticated) {
@@ -962,8 +962,14 @@ async function runHTTP() {
       return;
     }
 
-    // Show picker page
-    const accessToken = driveService.getAccessToken();
+    // Show picker page — get a fresh (auto-refreshed) access token
+    let accessToken: string;
+    try {
+      accessToken = await driveService.getFreshAccessToken();
+    } catch {
+      res.redirect('/?error=token_refresh_failed');
+      return;
+    }
     const clientId = driveService.getClientId();
 
     res.send(`

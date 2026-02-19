@@ -108,10 +108,15 @@ export class DriveService {
   }
 
   /**
-   * Get access token for client-side APIs (like Picker)
+   * Get a fresh access token for client-side APIs (like Picker).
+   * Auto-refreshes via refresh token if expired.
    */
-  getAccessToken(): string | null | undefined {
-    return this.oauth2Client.credentials.access_token;
+  async getFreshAccessToken(): Promise<string> {
+    const { token } = await this.oauth2Client.getAccessToken();
+    if (!token) throw new Error('Failed to obtain access token');
+    // Persist any newly refreshed credentials
+    this.saveTokens();
+    return token;
   }
 
   /**
