@@ -6,7 +6,7 @@
 import { google, drive_v3 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { GOOGLE_DRIVE_SCOPES } from '../constants.js';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, chmodSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -27,6 +27,8 @@ export class DriveService {
     // Load persisted tokens on startup
     if (existsSync(TOKEN_PATH)) {
       try {
+        // Fix permissions on pre-existing token files
+        chmodSync(TOKEN_PATH, 0o600);
         const tokens = JSON.parse(readFileSync(TOKEN_PATH, 'utf-8'));
         this.oauth2Client.setCredentials(tokens);
         this.drive = google.drive({ version: 'v3', auth: this.oauth2Client });

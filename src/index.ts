@@ -1023,7 +1023,7 @@ async function runHTTP() {
         <body>
           <div class="card">
             <h1>🗂️ Google Drive MCP</h1>
-            <a href="${driveService.getAuthUrl()}" class="btn">Sign in with Google</a>
+            <a href="${escapeHtml(driveService.getAuthUrl())}" class="btn">Sign in with Google</a>
           </div>
         </body>
         </html>
@@ -1041,6 +1041,7 @@ async function runHTTP() {
     }
     const clientId = driveService.getClientId();
 
+    res.set('Cache-Control', 'no-store');
     res.send(`
 <!DOCTYPE html>
 <html>
@@ -1105,8 +1106,8 @@ async function runHTTP() {
   </style>
   <script src="https://apis.google.com/js/api.js"></script>
   <script>
-    const CLIENT_ID = '${clientId}';
-    const ACCESS_TOKEN = '${accessToken}';
+    const CLIENT_ID = ${JSON.stringify(clientId)};
+    const ACCESS_TOKEN = ${JSON.stringify(accessToken)};
     let pickerApiLoaded = false;
 
     function onApiLoad() {
@@ -1121,7 +1122,7 @@ async function runHTTP() {
       if (!pickerApiLoaded) return;
 
       const picker = new google.picker.PickerBuilder()
-        .setAppId('${appId}')
+        .setAppId(${JSON.stringify(appId)})
         .addView(google.picker.ViewId.DOCS)
         .setOAuthToken(ACCESS_TOKEN)
         .setCallback(pickerCallback)
@@ -1162,7 +1163,12 @@ async function runHTTP() {
       list.innerHTML = '';
       files.forEach(file => {
         const li = document.createElement('li');
-        li.innerHTML = \`<strong>\${file.name}</strong><small>ID: \${file.id}</small>\`;
+        const strong = document.createElement('strong');
+        strong.textContent = file.name;
+        const small = document.createElement('small');
+        small.textContent = 'ID: ' + file.id;
+        li.appendChild(strong);
+        li.appendChild(small);
         list.appendChild(li);
       });
     }
@@ -1252,6 +1258,17 @@ async function runHTTP() {
 
       if (!Array.isArray(fileIds) || fileIds.length === 0) {
         res.json({ success: false, error: 'No file IDs provided' });
+        return;
+      }
+
+      if (fileIds.length > 100) {
+        res.json({ success: false, error: 'Too many file IDs (max 100)' });
+        return;
+      }
+
+      const validId = /^[a-zA-Z0-9_-]+$/;
+      if (!fileIds.every((id: unknown) => typeof id === 'string' && validId.test(id))) {
+        res.json({ success: false, error: 'Invalid file ID format' });
         return;
       }
 
