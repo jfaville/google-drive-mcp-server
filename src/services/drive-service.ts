@@ -39,7 +39,7 @@ export class DriveService {
 
   private saveTokens(): void {
     try {
-      writeFileSync(TOKEN_PATH, JSON.stringify(this.oauth2Client.credentials), 'utf-8');
+      writeFileSync(TOKEN_PATH, JSON.stringify(this.oauth2Client.credentials), { encoding: 'utf-8', mode: 0o600 });
     } catch {
       console.error('Warning: could not persist tokens to disk.');
     }

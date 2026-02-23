@@ -114,6 +114,19 @@ export function formatError(error: unknown): string {
 }
 
 /**
+ * Escape a string for safe interpolation into HTML
+ */
+export function escapeHtml(value: unknown): string {
+  const str = String(value ?? '');
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
  * Build a Google Drive API search query
  */
 export function buildSearchQuery(params: {
@@ -129,7 +142,7 @@ export function buildSearchQuery(params: {
   }
   
   if (params.parent_id) {
-    conditions.push(`'${params.parent_id}' in parents`);
+    conditions.push(`'${params.parent_id.replace(/'/g, "\\'")}' in parents`);
   }
   
   if (params.query) {

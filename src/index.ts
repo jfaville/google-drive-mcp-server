@@ -13,7 +13,7 @@ import express from "express";
 import { z } from "zod";
 import { DriveService } from './services/drive-service.js';
 import { drive_v3 } from 'googleapis';
-import { formatError, formatFileListMarkdown, formatFileMarkdown, truncateText, buildSearchQuery } from './services/utils.js';
+import { formatError, formatFileListMarkdown, formatFileMarkdown, truncateText, buildSearchQuery, escapeHtml } from './services/utils.js';
 import { ResponseFormat, GOOGLE_DOC_EXPORT_MIME_TYPES } from './constants.js';
 import {
   ListFilesInputSchema,
@@ -906,6 +906,75 @@ async function runHTTP() {
   const app = express();
   app.use(express.json());
 
+  // --- Rate limiting (per-IP, in-memory) ---
+  const rateLimitWindow = 60_000; // 1 minute
+  const rateLimitMax = 60;        // requests per window
+  const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+
+  app.use((req, res, next) => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    let bucket = rateBuckets.get(ip);
+
+    if (!bucket || now >= bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + rateLimitWindow };
+      rateBuckets.set(ip, bucket);
+    }
+
+    bucket.count++;
+    if (bucket.count > rateLimitMax) {
+      res.status(429).json({ error: 'Too many requests. Try again later.' });
+      return;
+    }
+    next();
+  });
+
+  // Clean up stale rate-limit buckets every 5 minutes
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, bucket] of rateBuckets) {
+      if (now >= bucket.resetAt) rateBuckets.delete(ip);
+    }
+  }, 5 * 60_000).unref();
+
+  // --- Origin checking for mutating endpoints ---
+  // ALLOWED_ORIGINS can be set to a comma-separated list of origins
+  // (e.g. "http://localhost:3000,https://myserver.example").
+  // Falls back to http://localhost:{port} if unset.
+  const allowedOrigins = new Set(
+    (process.env.ALLOWED_ORIGINS || `http://localhost:${port}`)
+      .split(',')
+      .map(o => o.trim())
+      .filter(Boolean)
+  );
+
+  function checkOrigin(req: express.Request, res: express.Response, next: express.NextFunction): void {
+    const origin = req.headers['origin'];
+    const referer = req.headers['referer'];
+
+    // Allow requests with no Origin header (non-browser clients like curl, MCP SDK)
+    if (!origin && !referer) {
+      next();
+      return;
+    }
+
+    // If an Origin or Referer is present, it must match an allowed origin
+    if (origin && allowedOrigins.has(origin)) {
+      next();
+      return;
+    }
+    if (referer) {
+      for (const allowed of allowedOrigins) {
+        if (referer.startsWith(allowed + '/') || referer === allowed) {
+          next();
+          return;
+        }
+      }
+    }
+
+    res.status(403).json({ error: 'Forbidden: cross-origin request rejected.' });
+  }
+
   // Landing page / Picker page (combined)
   app.get('/', async (req, res) => {
     const isAuthenticated = driveService.isAuthenticated();
@@ -1136,7 +1205,7 @@ async function runHTTP() {
         <head><title>Authentication Error</title></head>
         <body style="font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px;">
           <h1 style="color: #d32f2f;">❌ Authentication Failed</h1>
-          <p>Error: ${error}</p>
+          <p>Error: ${escapeHtml(error)}</p>
           <p>You can close this window and try again.</p>
         </body>
         </html>
@@ -1168,7 +1237,7 @@ async function runHTTP() {
         <head><title>Authentication Error</title></head>
         <body style="font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px;">
           <h1 style="color: #d32f2f;">❌ Authentication Error</h1>
-          <p>${error.message || 'Unknown error occurred'}</p>
+          <p>${escapeHtml(error.message || 'Unknown error occurred')}</p>
           <p>Please try authenticating again.</p>
         </body>
         </html>
@@ -1177,7 +1246,7 @@ async function runHTTP() {
   });
 
   // API endpoint to "open" files selected via Picker
-  app.post('/api/open-files', async (req, res) => {
+  app.post('/api/open-files', checkOrigin, async (req, res) => {
     try {
       const { fileIds } = req.body;
 
@@ -1218,7 +1287,7 @@ async function runHTTP() {
     }
   });
 
-  app.post('/mcp', async (req, res) => {
+  app.post('/mcp', checkOrigin, async (req, res) => {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true
