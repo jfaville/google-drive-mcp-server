@@ -15,6 +15,32 @@ import { DriveService } from './services/drive-service.js';
 import { drive_v3 } from 'googleapis';
 import { formatError, formatFileListMarkdown, formatFileMarkdown, truncateText, buildSearchQuery, escapeHtml } from './services/utils.js';
 import { ResponseFormat, GOOGLE_DOC_EXPORT_MIME_TYPES } from './constants.js';
+
+/** Escape a string for safe interpolation into HTML. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Build comment/reply content with optional prefix and anchor quote.
+ * Controlled by env vars COMMENT_PREFIX and COMMENT_SHOW_ANCHOR_QUOTE.
+ */
+function buildCommentContent(content: string, quotedText?: string): string {
+  const prefix = process.env.COMMENT_PREFIX;
+  const showAnchor = process.env.COMMENT_SHOW_ANCHOR_QUOTE === 'true';
+
+  const parts: string[] = [];
+  if (prefix) parts.push(prefix);
+  if (showAnchor && quotedText) parts.push(`_Re: '${quotedText.trim()}'_`);
+  parts.push(content);
+
+  return parts.join('\n\n');
+}
 import {
   ListFilesInputSchema,
   SearchFilesInputSchema,
@@ -41,6 +67,87 @@ import type {
   CreateFolderInput
 } from './schemas/input-schemas.js';
 import { FileMetadata, FileListResult } from './types.js';
+import { DocsService } from './services/docs-service.js';
+import {
+  GetDocumentInputSchema,
+  ListTabsInputSchema,
+  CreateDocumentInputSchema,
+  InsertTextInputSchema,
+  DeleteRangeInputSchema,
+  UpdateTextStyleInputSchema,
+  UpdateParagraphStyleInputSchema,
+  ReplaceAllTextInputSchema,
+  BatchUpdateInputSchema
+} from './schemas/docs-input-schemas.js';
+import {
+  DocumentMetadataOutputSchema,
+  BatchUpdateResultOutputSchema,
+  ReplaceAllResultOutputSchema
+} from './schemas/docs-output-schemas.js';
+import type {
+  GetDocumentInput,
+  ListTabsInput,
+  CreateDocumentInput,
+  InsertTextInput,
+  DeleteRangeInput,
+  UpdateTextStyleInput,
+  UpdateParagraphStyleInput,
+  ReplaceAllTextInput,
+  BatchUpdateInput
+} from './schemas/docs-input-schemas.js';
+import {
+  simplifyDocument,
+  formatDocumentMarkdown,
+  buildTextStyle,
+  truncateDocContent
+} from './services/docs-utils.js';
+import type { SimplifiedDocument, BatchUpdateResult, ReplaceAllResult } from './services/docs-utils.js';
+import {
+  ListCommentsInputSchema,
+  GetCommentInputSchema,
+  AddCommentInputSchema,
+  UpdateCommentInputSchema,
+  DeleteCommentInputSchema as DeleteCommentInputSchemaComments,
+  ReplyToCommentInputSchema,
+  ResolveCommentInputSchema,
+  ListRepliesInputSchema,
+} from './schemas/comments-input-schemas.js';
+import type {
+  ListCommentsInput,
+  GetCommentInput,
+  AddCommentInput,
+  UpdateCommentInput,
+  DeleteCommentInput as DeleteCommentInputType,
+  ReplyToCommentInput,
+  ResolveCommentInput,
+  ListRepliesInput,
+} from './schemas/comments-input-schemas.js';
+import {
+  CommentDetailOutputSchema,
+  CommentListOutputSchema,
+  ReplyDetailOutputSchema,
+  ReplyListOutputSchema,
+  DeleteCommentOutputSchema,
+} from './schemas/comments-output-schemas.js';
+import {
+  mapComment,
+  mapReply,
+  formatCommentMarkdown,
+  formatCommentListMarkdown,
+  extractTextFromDocBody,
+  buildCommentAnchor,
+} from './services/comments-utils.js';
+import type { CommentData, CommentListResult, ReplyListResult } from './services/comments-utils.js';
+import {
+  InsertTableInputSchema,
+  InsertPageBreakInputSchema,
+  InsertImageInputSchema,
+} from './schemas/additional-docs-input-schemas.js';
+import type {
+  InsertTableInput,
+  InsertPageBreakInput,
+  InsertImageInput,
+} from './schemas/additional-docs-input-schemas.js';
 
 // Initialize MCP server
 const server = new McpServer({
@@ -65,6 +172,7 @@ const redirectUri = isHttpMode
   ? `http://localhost:${port}/oauth/callback`
   : 'http://localhost';
 const driveService = new DriveService(clientId, clientSecret, redirectUri);
+const docsService = new DocsService(driveService.getOAuth2Client());
 
 // Extract project number from client ID (e.g. "566896755544-xxx..." → "566896755544")
 // Required by Google Picker API to register file access grants under drive.file scope
@@ -895,6 +1003,1342 @@ Don't use when: Running in stdio mode. Don't use when the file was already selec
   }
 );
 
+// ============================================================
+// Google Docs API Tools
+// ============================================================
+
+/**
+ * Tool: gdocs_get_document
+ * Get document metadata and optionally structured content
+ */
+server.registerTool(
+  "gdocs_get_document",
+  {
+    title: "Get Google Doc",
+    description: `Retrieve metadata and optionally the full structured content of a Google Doc, including text, formatting (bold, italic, etc.), heading styles, and character indices.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - include_content (boolean, optional): Include full body with formatting info (default: false)
+  - suggestions_view_mode (string, optional): How to render suggestions — one of: SUGGESTIONS_INLINE (default, required for correct character indices), PREVIEW_SUGGESTIONS_ACCEPTED, PREVIEW_WITHOUT_SUGGESTIONS
+  - response_format ('markdown' | 'json', optional): Output format (default: markdown)
+
+Returns:
+  { documentId, title, revisionId, body?: { content: [{ startIndex, endIndex, text, namedStyleType?, elements: [{ content, startIndex, endIndex, bold?, italic?, ... }] }] } }
+
+The body includes character indices for every paragraph and text run — use these indices with gdocs_insert_text, gdocs_delete_range, and gdocs_update_text_style.
+
+Important: If the document contains suggestions (tracked changes), use suggestions_view_mode to control how they appear. SUGGESTIONS_INLINE is the only mode that returns correct character indices for subsequent batchUpdate operations.
+
+Don't use when: The doc hasn't been opened via the Picker or created by this app — you'll get a 403/404.`,
+    inputSchema: GetDocumentInputSchema,
+    outputSchema: DocumentMetadataOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: GetDocumentInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const getParams: any = { documentId: params.document_id, includeTabsContent: true };
+      if (params.suggestions_view_mode) {
+        getParams.suggestionsViewMode = params.suggestions_view_mode;
+      }
+      const response = await docs.documents.get(getParams);
+
+      const simplified = simplifyDocument(response.data, params.include_content, params.tab_id);
+
+      let text: string;
+      if (params.response_format === ResponseFormat.JSON) {
+        text = truncateDocContent(JSON.stringify(simplified, null, 2));
+      } else {
+        text = truncateDocContent(formatDocumentMarkdown(simplified));
+      }
+
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: simplified
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_list_tabs
+ * List all tabs in a Google Doc
+ */
+server.registerTool(
+  "gdocs_list_tabs",
+  {
+    title: "List Tabs in Google Doc",
+    description: `List all tabs in a Google Doc, including their IDs, titles, and nesting structure.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - response_format ('markdown' | 'json', optional): Output format (default: markdown)
+
+Returns:
+  { documentId, title, tabs: [{ tabId, title, index, childTabs? }] }
+
+Use tab IDs from this tool to target specific tabs in other gdocs tools.
+
+Don't use when: The doc hasn't been opened via the Picker or created by this app — you'll get a 403/404.`,
+    inputSchema: ListTabsInputSchema,
+    outputSchema: DocumentMetadataOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: ListTabsInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const response = await docs.documents.get({
+        documentId: params.document_id,
+        includeTabsContent: true
+      });
+
+      const simplified = simplifyDocument(response.data, false);
+
+      let text: string;
+      if (params.response_format === ResponseFormat.JSON) {
+        text = JSON.stringify({ documentId: simplified.documentId, title: simplified.title, tabs: simplified.tabs }, null, 2);
+      } else {
+        const parts: string[] = [`**${simplified.title}**`, `- Document ID: \`${simplified.documentId}\``, '', '## Tabs', ''];
+        const formatTab = (tab: any, depth: number) => {
+          const indent = '  '.repeat(depth);
+          parts.push(`${indent}- **${tab.title}** (ID: \`${tab.tabId}\`, index: ${tab.index})`);
+          if (tab.childTabs) {
+            for (const child of tab.childTabs) formatTab(child, depth + 1);
+          }
+        };
+        for (const tab of simplified.tabs || []) formatTab(tab, 0);
+        text = parts.join('\n');
+      }
+
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: { documentId: simplified.documentId, title: simplified.title, tabs: simplified.tabs }
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_create_document
+ * Create a new Google Doc
+ */
+server.registerTool(
+  "gdocs_create_document",
+  {
+    title: "Create Google Doc",
+    description: `Create a new Google Doc with a title and optional initial text content.
+
+Args:
+  - title (string): Document title (1-255 characters)
+  - content (string, optional): Initial text to insert into the document body
+
+Returns:
+  { documentId, title, revisionId }
+
+The created document is automatically accessible under the drive.file scope — no Picker step needed.
+
+Don't use when: The document already exists — use gdocs_insert_text or gdocs_replace_all_text instead.`,
+    inputSchema: CreateDocumentInputSchema,
+    outputSchema: DocumentMetadataOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: CreateDocumentInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const createResponse = await docs.documents.create({
+        requestBody: { title: params.title }
+      });
+
+      const docId = createResponse.data.documentId!;
+
+      if (params.content) {
+        await docs.documents.batchUpdate({
+          documentId: docId,
+          requestBody: {
+            requests: [{
+              insertText: {
+                text: params.content,
+                endOfSegmentLocation: { segmentId: '' }
+              }
+            }]
+          }
+        });
+      }
+
+      const simplified: SimplifiedDocument = {
+        documentId: docId,
+        title: createResponse.data.title!,
+        revisionId: createResponse.data.revisionId || undefined,
+      };
+
+      return {
+        content: [{ type: "text", text: `Successfully created document: ${simplified.title}\nID: ${simplified.documentId}` }],
+        structuredContent: simplified
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_insert_text
+ * Insert text at a specific position
+ */
+server.registerTool(
+  "gdocs_insert_text",
+  {
+    title: "Insert Text in Google Doc",
+    description: `Insert text at a specific position in a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - text (string): The text to insert
+  - index (number, optional): 1-based index at which to insert (use gdocs_get_document with include_content=true to see current indices)
+  - insert_at_end (boolean, optional): If true, insert at the end of the segment
+  - segment_id (string, optional): Segment ID (default: '' for document body)
+
+Provide either index OR set insert_at_end=true, not both.
+
+Note: Inserting text shifts all subsequent indices. If you need multiple operations, use gdocs_batch_update for atomicity.`,
+    inputSchema: InsertTextInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: InsertTextInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const insertRequest: any = { text: params.text };
+      if (params.insert_at_end) {
+        const loc: any = { segmentId: params.segment_id };
+        if (params.tab_id) loc.tabId = params.tab_id;
+        insertRequest.endOfSegmentLocation = loc;
+      } else {
+        const loc: any = { index: params.index, segmentId: params.segment_id };
+        if (params.tab_id) loc.tabId = params.tab_id;
+        insertRequest.location = loc;
+      }
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{ insertText: insertRequest }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+
+      return {
+        content: [{ type: "text", text: `Successfully inserted text into document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_delete_range
+ * Delete text in a range
+ */
+server.registerTool(
+  "gdocs_delete_range",
+  {
+    title: "Delete Text Range in Google Doc",
+    description: `Delete text in a specific index range within a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - start_index (number): Start index (inclusive)
+  - end_index (number): End index (exclusive)
+  - segment_id (string, optional): Segment ID (default: '' for document body)
+
+Use gdocs_get_document with include_content=true to see current indices before deleting.
+
+Note: Deleting text shifts all subsequent indices. If you need multiple operations, use gdocs_batch_update for atomicity.`,
+    inputSchema: DeleteRangeInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: DeleteRangeInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{
+            deleteContentRange: {
+              range: {
+                startIndex: params.start_index,
+                endIndex: params.end_index,
+                segmentId: params.segment_id,
+                ...(params.tab_id && { tabId: params.tab_id })
+              }
+            }
+          }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+
+      return {
+        content: [{ type: "text", text: `Successfully deleted range ${params.start_index}-${params.end_index} from document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_update_text_style
+ * Apply text formatting to a range
+ */
+server.registerTool(
+  "gdocs_update_text_style",
+  {
+    title: "Format Text in Google Doc",
+    description: `Apply text formatting (bold, italic, underline, font size, color, etc.) to a range in a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - start_index (number): Start index (inclusive)
+  - end_index (number): End index (exclusive)
+  - segment_id (string, optional): Segment ID (default: '' for document body)
+  - bold (boolean, optional): Set bold
+  - italic (boolean, optional): Set italic
+  - underline (boolean, optional): Set underline
+  - strikethrough (boolean, optional): Set strikethrough
+  - font_size (number, optional): Font size in points
+  - font_family (string, optional): Font family name
+  - foreground_color ({ red, green, blue }, optional): Text color (RGB, each 0-1)
+  - background_color ({ red, green, blue }, optional): Highlight color (RGB, each 0-1)
+  - link_url (string, optional): URL to link the text to
+
+Only the properties you provide will be changed; others remain unchanged.
+
+Use gdocs_get_document with include_content=true to see current indices and formatting.`,
+    inputSchema: UpdateTextStyleInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: UpdateTextStyleInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const { textStyle, fields } = buildTextStyle(params);
+
+      if (!fields) {
+        return {
+          content: [{ type: "text", text: "Error: No style properties provided. Specify at least one of: bold, italic, underline, strikethrough, font_size, font_family, foreground_color, background_color, link_url." }],
+          isError: true
+        };
+      }
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{
+            updateTextStyle: {
+              textStyle,
+              range: {
+                startIndex: params.start_index,
+                endIndex: params.end_index,
+                segmentId: params.segment_id,
+                ...(params.tab_id && { tabId: params.tab_id })
+              },
+              fields
+            }
+          }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+
+      return {
+        content: [{ type: "text", text: `Successfully applied text style (${fields}) to range ${params.start_index}-${params.end_index} in document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_update_paragraph_style
+ * Apply paragraph-level formatting
+ */
+server.registerTool(
+  "gdocs_update_paragraph_style",
+  {
+    title: "Format Paragraph in Google Doc",
+    description: `Apply paragraph-level formatting (heading style, alignment) to a range in a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - start_index (number): Start index (inclusive)
+  - end_index (number): End index (exclusive)
+  - segment_id (string, optional): Segment ID (default: '' for document body)
+  - named_style_type (string, optional): Heading style — one of: NORMAL_TEXT, TITLE, SUBTITLE, HEADING_1 through HEADING_6
+  - alignment (string, optional): Paragraph alignment — one of: START, CENTER, END, JUSTIFIED
+
+At least one of named_style_type or alignment must be provided.
+
+The range should cover at least one full paragraph (from its startIndex to endIndex as shown by gdocs_get_document).`,
+    inputSchema: UpdateParagraphStyleInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: UpdateParagraphStyleInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const paragraphStyle: any = {};
+      const fieldsList: string[] = [];
+
+      if (params.named_style_type !== undefined) {
+        paragraphStyle.namedStyleType = params.named_style_type;
+        fieldsList.push('namedStyleType');
+      }
+      if (params.alignment !== undefined) {
+        paragraphStyle.alignment = params.alignment;
+        fieldsList.push('alignment');
+      }
+
+      if (fieldsList.length === 0) {
+        return {
+          content: [{ type: "text", text: "Error: No paragraph style properties provided. Specify at least one of: named_style_type, alignment." }],
+          isError: true
+        };
+      }
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{
+            updateParagraphStyle: {
+              paragraphStyle,
+              range: {
+                startIndex: params.start_index,
+                endIndex: params.end_index,
+                segmentId: params.segment_id,
+                ...(params.tab_id && { tabId: params.tab_id })
+              },
+              fields: fieldsList.join(',')
+            }
+          }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+
+      return {
+        content: [{ type: "text", text: `Successfully applied paragraph style (${fieldsList.join(',')}) to range ${params.start_index}-${params.end_index} in document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_replace_all_text
+ * Find and replace all occurrences
+ */
+server.registerTool(
+  "gdocs_replace_all_text",
+  {
+    title: "Find and Replace in Google Doc",
+    description: `Find and replace all occurrences of a string in a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - find_text (string): The text to find
+  - replace_text (string): The replacement text (can be empty to delete all matches)
+  - match_case (boolean, optional): Case-sensitive search (default: true)
+
+Returns:
+  { documentId, occurrencesChanged }`,
+    inputSchema: ReplaceAllTextInputSchema,
+    outputSchema: ReplaceAllResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: ReplaceAllTextInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{
+            replaceAllText: {
+              containsText: {
+                text: params.find_text,
+                matchCase: params.match_case
+              },
+              replaceText: params.replace_text,
+              ...(params.tab_ids && { tabsCriteria: { tabIds: params.tab_ids } })
+            }
+          }]
+        }
+      });
+
+      const replies = response.data.replies || [];
+      const occurrencesChanged = (replies[0] as any)?.replaceAllText?.occurrencesChanged || 0;
+
+      const result: ReplaceAllResult = {
+        documentId: response.data.documentId!,
+        occurrencesChanged,
+      };
+
+      return {
+        content: [{ type: "text", text: `Replaced ${result.occurrencesChanged} occurrence(s) of "${params.find_text}" with "${params.replace_text}" in document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_batch_update
+ * Send multiple document operations atomically
+ */
+server.registerTool(
+  "gdocs_batch_update",
+  {
+    title: "Batch Update Google Doc",
+    description: `Send multiple document operations in a single atomic request. This is the power tool for complex edits.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - requests (array, max 100): Array of request objects. Each can contain one of:
+    - insertText: { text, location?: { index, segmentId }, endOfSegmentLocation?: { segmentId } }
+    - deleteContentRange: { range: { startIndex, endIndex, segmentId } }
+    - updateTextStyle: { textStyle: {...}, range: { startIndex, endIndex, segmentId }, fields: "bold,italic,..." }
+    - replaceAllText: { containsText: { text, matchCase }, replaceText }
+    - updateParagraphStyle: { paragraphStyle: {...}, range: { startIndex, endIndex, segmentId }, fields: "namedStyleType,..." }
+
+Important: Operations are applied in order. insertText and deleteContentRange shift indices — account for this when combining operations. When deleting and inserting, process from end-of-document to start to avoid index shifts affecting subsequent operations.`,
+    inputSchema: BatchUpdateInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: BatchUpdateInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: params.requests as any[]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+
+      return {
+        content: [{ type: "text", text: `Successfully executed ${params.requests.length} operation(s) on document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+// ============================================================
+// Google Drive Comments & Replies Tools
+// ============================================================
+
+/**
+ * Tool: gdrive_list_comments
+ * List all comments on a file
+ */
+server.registerTool(
+  "gdrive_list_comments",
+  {
+    title: "List Comments",
+    description: `List comments on a Google Drive file, including author, content, resolved status, quoted text, and reply threads.
+
+Due to the drive.file scope, only files created by this app or opened via the Picker are accessible.
+
+Args:
+  - file_id (string): The Drive file ID
+  - page_size (number, optional): Number of comments to return (1-100, default: 20)
+  - page_token (string, optional): Pagination token from a previous response
+  - include_resolved (boolean, optional): Whether to include resolved comments (default: true)
+
+Returns:
+  { count, comments: [{ id, content, author, createdTime, resolved, quotedText, replies }], has_more, next_page_token }
+
+Don't use when: The file hasn't been opened via the Picker — you'll get a 404.`,
+    inputSchema: ListCommentsInputSchema,
+    outputSchema: CommentListOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: ListCommentsInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const response = await drive.comments.list({
+        fileId: params.file_id,
+        pageSize: params.page_size,
+        pageToken: params.page_token,
+        fields: 'nextPageToken,comments(id,content,quotedFileContent,author,createdTime,modifiedTime,resolved,replies(id,content,author,createdTime,modifiedTime,action))',
+      });
+
+      let comments = (response.data.comments || []).map(mapComment);
+      if (!params.include_resolved) {
+        comments = comments.filter(c => !c.resolved);
+      }
+
+      const result: CommentListResult = {
+        count: comments.length,
+        comments,
+        has_more: !!response.data.nextPageToken,
+        next_page_token: response.data.nextPageToken || undefined,
+      };
+
+      const text = formatCommentListMarkdown(result);
+      return { content: [{ type: "text", text }], structuredContent: result };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_get_comment
+ * Get a specific comment with its reply thread
+ */
+server.registerTool(
+  "gdrive_get_comment",
+  {
+    title: "Get Comment",
+    description: `Retrieve a specific comment on a Google Drive file, optionally including the full reply thread.
+
+Args:
+  - file_id (string): The Drive file ID
+  - comment_id (string): The comment ID (from gdrive_list_comments)
+  - include_replies (boolean, optional): Whether to include the full reply thread (default: true)
+
+Returns:
+  { id, content, author, createdTime, resolved, quotedText, replies? }
+
+Don't use when: You want to list all comments — use gdrive_list_comments instead.`,
+    inputSchema: GetCommentInputSchema,
+    outputSchema: CommentDetailOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: GetCommentInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      let fields = 'id,content,quotedFileContent,author,createdTime,modifiedTime,resolved';
+      if (params.include_replies) {
+        fields += ',replies(id,content,author,createdTime,modifiedTime,action)';
+      }
+
+      const response = await drive.comments.get({
+        fileId: params.file_id,
+        commentId: params.comment_id,
+        fields,
+        includeDeleted: false,
+      });
+
+      const comment = mapComment(response.data);
+      const text = formatCommentMarkdown(comment);
+      return { content: [{ type: "text", text }], structuredContent: comment };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_add_comment
+ * Create a comment, optionally anchored to a text range in a Google Doc
+ */
+server.registerTool(
+  "gdrive_add_comment",
+  {
+    title: "Add Comment",
+    description: `Create a comment on a Google Drive file. For Google Docs, you can anchor the comment to a specific text range.
+
+Args:
+  - file_id (string): The Drive file ID
+  - content (string): The comment text
+  - document_id (string, optional): The Google Doc ID (same as file_id for Docs). Required for anchored comments.
+  - start_index (number, optional): Start index (1-based, from gdocs_get_document) of the text to anchor to
+  - end_index (number, optional): End index (exclusive) of the text to anchor to
+  - quoted_text (string, optional): The exact quoted text. If omitted with start/end indices, extracted automatically.
+
+For anchored comments, all three of document_id, start_index, and end_index must be provided.
+
+Note: Programmatically created anchored comments appear in the comments panel but may not show visual anchoring in the Docs UI (Google API limitation).
+
+Examples:
+  - Unanchored comment: { file_id: "abc123", content: "Great work!" }
+  - Anchored comment: { file_id: "abc123", content: "Rephrase this", document_id: "abc123", start_index: 5, end_index: 20 }
+
+Don't use when: Replying to an existing comment — use gdrive_reply_to_comment instead.`,
+    inputSchema: AddCommentInputSchema,
+    outputSchema: CommentDetailOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: AddCommentInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const requestBody: any = {};
+      let quotedText: string | undefined;
+
+      if (params.document_id && params.start_index !== undefined && params.end_index !== undefined) {
+        requestBody.anchor = buildCommentAnchor(params.document_id, params.start_index, params.end_index);
+
+        quotedText = params.quoted_text;
+        if (!quotedText) {
+          const docs = docsService.getDocs();
+          const docResponse = await docs.documents.get({ documentId: params.document_id });
+          if (docResponse.data.body) {
+            quotedText = extractTextFromDocBody(docResponse.data.body, params.start_index, params.end_index);
+          }
+        }
+
+        if (quotedText) {
+          requestBody.quotedFileContent = {
+            mimeType: 'text/html',
+            value: quotedText,
+          };
+        }
+      }
+
+      requestBody.content = buildCommentContent(params.content, quotedText);
+
+      const response = await drive.comments.create({
+        fileId: params.file_id,
+        requestBody,
+        fields: 'id,content,quotedFileContent,author,createdTime,resolved',
+      });
+
+      const comment = mapComment(response.data);
+      const text = `Comment created on file ${params.file_id}\n${formatCommentMarkdown(comment)}`;
+      return { content: [{ type: "text", text }], structuredContent: comment };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_update_comment
+ * Edit an existing comment's text
+ */
+server.registerTool(
+  "gdrive_update_comment",
+  {
+    title: "Update Comment",
+    description: `Update the text content of an existing comment. Only the comment creator can update it.
+
+Args:
+  - file_id (string): The Drive file ID
+  - comment_id (string): The comment ID to update
+  - content (string): The new comment text
+
+Returns:
+  { id, content, author, createdTime, modifiedTime, resolved }
+
+Don't use when: You want to resolve a comment — use gdrive_resolve_comment instead.`,
+    inputSchema: UpdateCommentInputSchema,
+    outputSchema: CommentDetailOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: UpdateCommentInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const response = await drive.comments.update({
+        fileId: params.file_id,
+        commentId: params.comment_id,
+        requestBody: { content: buildCommentContent(params.content) },
+        fields: 'id,content,author,createdTime,modifiedTime,resolved',
+      });
+
+      const comment = mapComment(response.data);
+      return {
+        content: [{ type: "text", text: `Comment ${comment.id} updated successfully` }],
+        structuredContent: comment
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_delete_comment
+ * Permanently delete a comment
+ */
+server.registerTool(
+  "gdrive_delete_comment",
+  {
+    title: "Delete Comment",
+    description: `Permanently delete a comment and all its replies from a Google Drive file. This cannot be undone. Only the comment creator can delete it.
+
+Args:
+  - file_id (string): The Drive file ID
+  - comment_id (string): The comment ID to delete
+
+Returns:
+  { file_id, comment_id } confirming what was removed
+
+Don't use when: You want to resolve a comment instead of deleting it — use gdrive_resolve_comment.`,
+    inputSchema: DeleteCommentInputSchemaComments,
+    outputSchema: DeleteCommentOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: DeleteCommentInputType) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      await drive.comments.delete({
+        fileId: params.file_id,
+        commentId: params.comment_id,
+      });
+
+      const result = { file_id: params.file_id, comment_id: params.comment_id };
+      return {
+        content: [{ type: "text", text: `Comment ${params.comment_id} deleted from file ${params.file_id}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_reply_to_comment
+ * Add a reply to an existing comment thread
+ */
+server.registerTool(
+  "gdrive_reply_to_comment",
+  {
+    title: "Reply to Comment",
+    description: `Add a reply to an existing comment thread on a Google Drive file.
+
+Args:
+  - file_id (string): The Drive file ID
+  - comment_id (string): The comment ID to reply to
+  - content (string): The reply text
+
+Returns:
+  { id, content, author, createdTime, action }
+
+Don't use when: You want to resolve a comment — use gdrive_resolve_comment instead. Don't use when creating a new top-level comment — use gdrive_add_comment.`,
+    inputSchema: ReplyToCommentInputSchema,
+    outputSchema: ReplyDetailOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: ReplyToCommentInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const response = await drive.replies.create({
+        fileId: params.file_id,
+        commentId: params.comment_id,
+        requestBody: { content: buildCommentContent(params.content) },
+        fields: 'id,content,author,createdTime,action',
+      });
+
+      const reply = mapReply(response.data);
+      return {
+        content: [{ type: "text", text: `Reply added to comment ${params.comment_id}` }],
+        structuredContent: reply
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_resolve_comment
+ * Resolve a comment by creating a reply with action: 'resolve'
+ */
+server.registerTool(
+  "gdrive_resolve_comment",
+  {
+    title: "Resolve Comment",
+    description: `Resolve a comment on a Google Drive file. This creates a reply with action "resolve", which marks the comment as resolved.
+
+Args:
+  - file_id (string): The Drive file ID
+  - comment_id (string): The comment ID to resolve
+
+Returns:
+  { id, content, author, createdTime, action }
+
+Don't use when: You want to delete a comment — use gdrive_delete_comment. Don't use when you want to add a regular reply — use gdrive_reply_to_comment.`,
+    inputSchema: ResolveCommentInputSchema,
+    outputSchema: ReplyDetailOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: ResolveCommentInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const response = await drive.replies.create({
+        fileId: params.file_id,
+        commentId: params.comment_id,
+        requestBody: {
+          content: buildCommentContent('Resolved'),
+          action: 'resolve',
+        },
+        fields: 'id,content,author,createdTime,action',
+      });
+
+      const reply = mapReply(response.data);
+      return {
+        content: [{ type: "text", text: `Comment ${params.comment_id} resolved` }],
+        structuredContent: reply
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_list_replies
+ * List replies on a specific comment
+ */
+server.registerTool(
+  "gdrive_list_replies",
+  {
+    title: "List Replies",
+    description: `List all replies on a specific comment thread.
+
+Args:
+  - file_id (string): The Drive file ID
+  - comment_id (string): The comment ID
+  - page_size (number, optional): Number of replies to return (1-100, default: 20)
+  - page_token (string, optional): Pagination token from a previous response
+
+Returns:
+  { count, replies: [{ id, content, author, createdTime, action }], has_more, next_page_token }
+
+Don't use when: You want the full comment with its replies — use gdrive_get_comment with include_replies=true instead.`,
+    inputSchema: ListRepliesInputSchema,
+    outputSchema: ReplyListOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  async (params: ListRepliesInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const response = await drive.replies.list({
+        fileId: params.file_id,
+        commentId: params.comment_id,
+        pageSize: params.page_size,
+        pageToken: params.page_token,
+        fields: 'nextPageToken,replies(id,content,author,createdTime,modifiedTime,action)',
+      });
+
+      const replies = (response.data.replies || []).map(mapReply);
+      const result: ReplyListResult = {
+        count: replies.length,
+        replies,
+        has_more: !!response.data.nextPageToken,
+        next_page_token: response.data.nextPageToken || undefined,
+      };
+
+      const parts = [`# Replies (${result.count})\n`];
+      for (const reply of result.replies) {
+        const authorStr = reply.author ? ` (${reply.author})` : '';
+        const actionStr = reply.action ? ` [${reply.action}]` : '';
+        parts.push(`- ${reply.content}${authorStr}${actionStr}`);
+      }
+      if (result.has_more) {
+        parts.push(`\n*More replies available. Use next_page_token: \`${result.next_page_token}\`*`);
+      }
+
+      return { content: [{ type: "text", text: parts.join('\n') }], structuredContent: result };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+// ============================================================
+// Additional Google Docs Tools
+// ============================================================
+
+/**
+ * Tool: gdocs_insert_table
+ * Insert a table into a Google Doc
+ */
+server.registerTool(
+  "gdocs_insert_table",
+  {
+    title: "Insert Table in Google Doc",
+    description: `Insert a table with custom dimensions into a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - rows (number): Number of rows (1-50)
+  - columns (number): Number of columns (1-20)
+  - index (number, optional): 1-based index at which to insert the table
+  - insert_at_end (boolean, optional): If true, insert at the end of the document
+
+Provide either index OR set insert_at_end=true, not both.
+
+Note: Inserting a table shifts all subsequent indices. Use gdocs_get_document to check current indices.`,
+    inputSchema: InsertTableInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: InsertTableInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const insertRequest: any = {
+        rows: params.rows,
+        columns: params.columns,
+      };
+      if (params.insert_at_end) {
+        const loc: any = { segmentId: '' };
+        if (params.tab_id) loc.tabId = params.tab_id;
+        insertRequest.endOfSegmentLocation = loc;
+      } else {
+        const loc: any = { index: params.index };
+        if (params.tab_id) loc.tabId = params.tab_id;
+        insertRequest.location = loc;
+      }
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{ insertTable: insertRequest }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+      return {
+        content: [{ type: "text", text: `Inserted ${params.rows}x${params.columns} table into document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_insert_page_break
+ * Insert a page break into a Google Doc
+ */
+server.registerTool(
+  "gdocs_insert_page_break",
+  {
+    title: "Insert Page Break in Google Doc",
+    description: `Insert a page break at a specific position in a Google Doc.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - index (number): 1-based index at which to insert the page break
+  - segment_id (string, optional): Segment ID (default: '' for document body)
+
+Note: Inserting a page break shifts all subsequent indices.`,
+    inputSchema: InsertPageBreakInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: InsertPageBreakInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{
+            insertPageBreak: {
+              location: {
+                index: params.index,
+                segmentId: params.segment_id,
+                ...(params.tab_id && { tabId: params.tab_id })
+              }
+            }
+          }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+      return {
+        content: [{ type: "text", text: `Inserted page break at index ${params.index} in document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdocs_insert_image
+ * Insert an inline image into a Google Doc
+ */
+server.registerTool(
+  "gdocs_insert_image",
+  {
+    title: "Insert Image in Google Doc",
+    description: `Insert an inline image from a URL into a Google Doc, with optional sizing.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - image_url (string): The URL of the image (must be publicly accessible)
+  - index (number, optional): 1-based index at which to insert the image
+  - insert_at_end (boolean, optional): If true, insert at the end of the document
+  - width (number, optional): Image width in points (72 points = 1 inch)
+  - height (number, optional): Image height in points (72 points = 1 inch)
+
+Provide either index OR set insert_at_end=true, not both.
+
+Note: The image URL must be publicly accessible. Google will fetch the image at the time of insertion.`,
+    inputSchema: InsertImageInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: InsertImageInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      const insertRequest: any = { uri: params.image_url };
+      if (params.insert_at_end) {
+        const loc: any = { segmentId: '' };
+        if (params.tab_id) loc.tabId = params.tab_id;
+        insertRequest.endOfSegmentLocation = loc;
+      } else {
+        const loc: any = { index: params.index };
+        if (params.tab_id) loc.tabId = params.tab_id;
+        insertRequest.location = loc;
+      }
+
+      if (params.width || params.height) {
+        insertRequest.objectSize = {};
+        if (params.width) {
+          insertRequest.objectSize.width = { magnitude: params.width, unit: 'PT' };
+        }
+        if (params.height) {
+          insertRequest.objectSize.height = { magnitude: params.height, unit: 'PT' };
+        }
+      }
+
+      const response = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{ insertInlineImage: insertRequest }]
+        }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: response.data.documentId!,
+        replies: response.data.replies || [],
+      };
+      return {
+        content: [{ type: "text", text: `Inserted image into document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
 // Transport setup functions
 async function runStdio() {
   const transport = new StdioServerTransport();
@@ -1314,7 +2758,7 @@ async function runHTTP() {
     await transport.handleRequest(req, res, req.body);
   });
 
-  app.listen(port, () => {
+  app.listen(port, '127.0.0.1', () => {
     console.error(`Google Drive MCP server running on http://localhost:${port}/mcp`);
   });
 }

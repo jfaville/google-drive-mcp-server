@@ -122,6 +122,13 @@ export class DriveService {
   }
 
   /**
+   * Get the underlying OAuth2 client for use by other Google API services
+   */
+  getOAuth2Client(): OAuth2Client {
+    return this.oauth2Client;
+  }
+
+  /**
    * Get client ID for client-side APIs
    */
   getClientId(): string {

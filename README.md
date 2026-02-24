@@ -1,6 +1,6 @@
-# Google Drive MCP Server
+# Google Drive & Docs MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that provides secure Google Drive access using the restrictive `drive.file` OAuth scope — the server can only access files it creates or files the user explicitly selects via the built-in Google Picker. It can never access the rest of a user's Drive.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that provides secure Google Drive and Google Docs access using the restrictive `drive.file` OAuth scope — the server can only access files it creates or files the user explicitly selects via the built-in Google Picker. It can never access the rest of a user's Drive.
 
 ---
 
@@ -8,17 +8,18 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 
 ```
 MCP Client (Claude Code, etc.)
-        │
-        │  JSON-RPC (stdio or HTTP)
-        ▼
-  Google Drive MCP Server
-     ├── /mcp          → MCP protocol endpoint
-     ├── /             → Login + Picker web UI
-     └── /oauth/callback → OAuth redirect handler
-        │
-        │  Google Drive API v3 (drive.file scope)
-        ▼
-    Google Drive
+        |
+        |  JSON-RPC (stdio or HTTP)
+        v
+  Google Drive & Docs MCP Server
+     |-- /mcp          -> MCP protocol endpoint
+     |-- /             -> Login + Picker web UI
+     \-- /oauth/callback -> OAuth redirect handler
+        |
+        |  Google Drive API v3 + Google Docs API v1
+        |  (drive.file scope)
+        v
+    Google Drive & Docs
   (permitted files only)
 ```
 
@@ -40,12 +41,12 @@ MCP Client (Claude Code, etc.)
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Create or select a project
-3. Enable the **Google Drive API** under *APIs & Services → Library*
-4. Create credentials under *APIs & Services → Credentials*:
-   - Click *Create Credentials → OAuth 2.0 Client ID*
+3. Enable the **Google Drive API** under *APIs & Services -> Library*
+4. Create credentials under *APIs & Services -> Credentials*:
+   - Click *Create Credentials -> OAuth 2.0 Client ID*
    - Application type: **Desktop app**
    - Copy the **Client ID** and **Client Secret**
-5. Under *APIs & Services → OAuth consent screen*:
+5. Under *APIs & Services -> OAuth consent screen*:
    - Add your Google account email as a **Test user** (required while the app's publishing status is "Testing")
 
 ---
@@ -134,7 +135,9 @@ This server uses `https://www.googleapis.com/auth/drive.file` — the most restr
 | Files created by this app | Any other file in the user's Drive |
 | Files selected via the Google Picker | Files from other apps |
 
-**The Picker** is the mechanism that grants access to existing files. When a user selects a file through the Picker UI, Google's backend registers that this OAuth client can access it. Subsequent Drive API calls for that file succeed.
+Both the Drive API and the Docs API respect this scope. The Docs tools can only read and edit documents that this server created or that the user selected via the Picker.
+
+**The Picker** is the mechanism that grants access to existing files. When a user selects a file through the Picker UI, Google's backend registers that this OAuth client can access it. Subsequent Drive and Docs API calls for that file succeed.
 
 **Important implementation detail:** The Picker requires `setAppId` to be set to the Google Cloud project number (the numeric prefix of the Client ID). Without this, file access grants are not registered correctly. The server extracts this automatically from `GOOGLE_CLIENT_ID`.
 
@@ -157,7 +160,7 @@ This server uses `https://www.googleapis.com/auth/drive.file` — the most restr
 |------|-------------|
 | `gdrive_open_picker` | Returns the Picker URL (`http://localhost:PORT`). HTTP mode only. The user must open it and select files before those files are accessible to other tools. |
 
-### Read Operations
+### Drive — Read Operations
 
 | Tool | Description |
 |------|-------------|
@@ -165,7 +168,7 @@ This server uses `https://www.googleapis.com/auth/drive.file` — the most restr
 | `gdrive_search_files` | Search accessible files by name, with optional MIME type and folder filters. |
 | `gdrive_get_file` | Get metadata and optionally text content of a file. Supports Google Docs (plain text), Sheets (CSV), Slides (plain text), and regular text/JSON files. |
 
-### Write Operations
+### Drive — Write Operations
 
 | Tool | Description |
 |------|-------------|
@@ -175,6 +178,29 @@ This server uses `https://www.googleapis.com/auth/drive.file` — the most restr
 | `gdrive_copy_file` | Copy a file, optionally renaming it or placing it in a different folder. |
 | `gdrive_delete_file` | **Permanently delete** a file. Fetches the name first so the confirmation shows what was removed. |
 
+### Docs — Read Operations
+
+| Tool | Description |
+|------|-------------|
+| `gdocs_get_document` | Get document metadata and optionally the full structured content with formatting info (bold, italic, headings, character indices for every text run). Supports reading specific tabs via `tab_id`. |
+| `gdocs_list_tabs` | List all tabs in a document, including their IDs, titles, and nesting structure. Use this to discover tab IDs for other tools. |
+
+### Docs — Write Operations
+
+| Tool | Description |
+|------|-------------|
+| `gdocs_create_document` | Create a new Google Doc with a title and optional initial text content. |
+| `gdocs_insert_text` | Insert text at a specific index or at the end of the document. Supports `tab_id`. |
+| `gdocs_delete_range` | Delete text in a start/end index range. Supports `tab_id`. |
+| `gdocs_update_text_style` | Apply text formatting to a range: bold, italic, underline, strikethrough, font size/family, text color, highlight color, links. Supports `tab_id`. |
+| `gdocs_update_paragraph_style` | Apply paragraph formatting to a range: heading styles (HEADING_1 through HEADING_6, TITLE, SUBTITLE), alignment (START, CENTER, END, JUSTIFIED). Supports `tab_id`. |
+| `gdocs_replace_all_text` | Find and replace all occurrences of a string. Returns the number of replacements made. Supports `tab_ids` to restrict to specific tabs. |
+| `gdocs_batch_update` | Send multiple document operations (insert, delete, format, replace) in a single atomic request. Max 100 operations. Location and range objects support `tabId`. |
+
+### Document Tabs
+
+All Docs tools support [document tabs](https://developers.google.com/docs/api/concepts/tabs). Use `gdocs_list_tabs` to discover tab IDs, then pass `tab_id` to any read or write tool to target a specific tab. If `tab_id` is omitted, tools default to the first tab (backwards compatible).
+
 All list/search tools support `response_format: "markdown"` (default, human-readable) or `"json"` (structured, machine-readable). All tools return `structuredContent` for programmatic access by MCP clients.
 
 ---
@@ -183,17 +209,21 @@ All list/search tools support `response_format: "markdown"` (default, human-read
 
 ```
 src/
-├── index.ts                  # MCP tool registration, Express routes, transport setup
-├── constants.ts              # Shared constants (OAuth scopes, limits, MIME type map)
-├── types.ts                  # TypeScript interfaces (FileMetadata, FileListResult, etc.)
-├── schemas/
-│   ├── input-schemas.ts      # Zod input schemas for all tool parameters
-│   └── output-schemas.ts     # Zod output schemas for tool structured responses
-├── services/
-│   ├── drive-service.ts      # OAuth2 client, token persistence, Drive API wrapper
-│   └── utils.ts              # Formatting helpers, error handling, query builder
-└── tests/
-    └── utils.test.ts         # Unit tests for utility functions
+|-- index.ts                      # MCP tool registration, Express routes, transport setup
+|-- constants.ts                  # Shared constants (OAuth scopes, limits, MIME type map)
+|-- types.ts                      # TypeScript interfaces (FileMetadata, FileListResult, etc.)
+|-- schemas/
+|   |-- input-schemas.ts          # Zod input schemas for Drive tool parameters
+|   |-- output-schemas.ts         # Zod output schemas for Drive tool responses
+|   |-- docs-input-schemas.ts     # Zod input schemas for Docs tool parameters
+|   \-- docs-output-schemas.ts    # Zod output schemas for Docs tool responses
+|-- services/
+|   |-- drive-service.ts          # OAuth2 client, token persistence, Drive API wrapper
+|   |-- docs-service.ts           # Docs API wrapper (shares OAuth client with DriveService)
+|   |-- utils.ts                  # Drive formatting helpers, error handling, query builder
+|   \-- docs-utils.ts             # Docs formatting helpers, document simplification, style builder
+\-- tests/
+    \-- utils.test.ts             # Unit tests for utility functions
 ```
 
 **Generated / git-ignored files:**
@@ -235,10 +265,53 @@ Add to `~/.config/claude/claude_desktop_config.json`:
 
 ---
 
+## Recommended Hooks for Claude Code
+
+When using this server with Claude Code, many tools will prompt for approval on each call. You can reduce friction by auto-approving read-only tools via a hook in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__google-drive__gdrive_list_files|mcp__google-drive__gdrive_search_files|mcp__google-drive__gdrive_get_file|mcp__google-drive__gdocs_get_document|mcp__google-drive__gdocs_list_tabs|mcp__google-drive__gdrive_list_comments|mcp__google-drive__gdrive_get_comment|mcp__google-drive__gdrive_list_replies",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"decision\": \"approve\"}'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If you also want to auto-approve comment replies (useful if your documents are only shared with trusted collaborators):
+
+```json
+{
+  "matcher": "mcp__google-drive__gdrive_reply_to_comment|mcp__google-drive__gdrive_add_comment",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "echo '{\"decision\": \"approve\"}'"
+    }
+  ]
+}
+```
+
+Add this as a second entry in the `PreToolUse` array. Write operations (`gdrive_update_file`, `gdocs_insert_text`, `gdocs_delete_range`, etc.) are best left gated so you can review changes before they're applied.
+
+---
+
 ## Security Notes
 
 - `.env` and `.tokens.json` are both git-ignored — never commit them
 - `drive.file` is the least-privileged Drive scope; Google does not require app verification for it
+- The Google Docs API also respects `drive.file` — no additional scope is needed for document editing
 - The server binds only to `localhost` — it is not intended to be exposed to the internet
 - OAuth tokens include a refresh token and are reloaded on restart; delete `.tokens.json` to force re-authentication
 - MIME type and name values in Drive API search queries are single-quote-escaped to prevent query injection
+- HTML responses escape user-supplied values to prevent XSS
+- Batch update requests are capped at 100 operations to prevent abuse
