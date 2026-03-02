@@ -12,6 +12,12 @@ export interface SimplifiedParagraph {
   text: string;
   namedStyleType?: string;
   alignment?: string;
+  listInfo?: {
+    listId: string;
+    nestingLevel: number;
+    ordered: boolean;
+    glyphFormat?: string;
+  };
   elements: SimplifiedTextRun[];
 }
 
@@ -27,6 +33,7 @@ export interface SimplifiedTextRun {
   fontSize?: number;
   fontFamily?: string;
   link?: string;
+  footnoteId?: string;
 }
 
 /** Simplified tab info */
@@ -48,6 +55,9 @@ export interface SimplifiedDocument {
   body?: {
     content: SimplifiedParagraph[];
   };
+  footnotes?: Record<string, {
+    content: SimplifiedParagraph[];
+  }>;
 }
 
 /** Result of a batch update */
@@ -99,7 +109,7 @@ function findTab(tabs: any[], tabId: string): any | null {
 /**
  * Extract body content from a list of structural elements
  */
-function extractParagraphs(content: docs_v1.Schema$StructuralElement[]): SimplifiedParagraph[] {
+function extractParagraphs(content: docs_v1.Schema$StructuralElement[], lists?: Record<string, docs_v1.Schema$List>): SimplifiedParagraph[] {
   const paragraphs: SimplifiedParagraph[] = [];
 
   for (const element of content) {
@@ -127,6 +137,16 @@ function extractParagraphs(content: docs_v1.Schema$StructuralElement[]): Simplif
 
           textRuns.push(run);
           fullText += el.textRun.content || '';
+        } else if ((el as any).footnoteReference) {
+          const fnRef = (el as any).footnoteReference;
+          const run: SimplifiedTextRun = {
+            content: '\u00B9', // superscript 1 as placeholder
+            startIndex: el.startIndex || 0,
+            endIndex: el.endIndex || 0,
+            footnoteId: fnRef.footnoteId,
+          };
+          textRuns.push(run);
+          fullText += '\u00B9';
         }
       }
 
@@ -145,7 +165,29 @@ function extractParagraphs(content: docs_v1.Schema$StructuralElement[]): Simplif
         simplified.alignment = pStyle.alignment;
       }
 
+      if (para.bullet?.listId) {
+        const listId = para.bullet.listId;
+        const nestingLevel = para.bullet.nestingLevel || 0;
+        const listDef = lists?.[listId];
+        const levelDef = listDef?.listProperties?.nestingLevels?.[nestingLevel];
+        simplified.listInfo = {
+          listId,
+          nestingLevel,
+          ordered: !!levelDef?.glyphType,
+          glyphFormat: levelDef?.glyphFormat || undefined,
+        };
+      }
+
       paragraphs.push(simplified);
+    } else if (element.table) {
+      // Recurse into table rows and cells to extract their paragraphs
+      for (const row of element.table.tableRows || []) {
+        for (const cell of row.tableCells || []) {
+          if (cell.content) {
+            paragraphs.push(...extractParagraphs(cell.content, lists));
+          }
+        }
+      }
     }
   }
 
@@ -181,13 +223,34 @@ export function simplifyDocument(doc: docs_v1.Schema$Document, includeContent: b
 
       result.activeTabId = targetTab.tabProperties?.tabId;
       const bodyContent = targetTab.documentTab?.body?.content;
+      const listsMap = targetTab.documentTab?.lists;
       if (bodyContent) {
-        result.body = { content: extractParagraphs(bodyContent) };
+        result.body = { content: extractParagraphs(bodyContent, listsMap) };
+      }
+      // Extract footnote content from tab
+      const footnotes = targetTab.documentTab?.footnotes;
+      if (footnotes) {
+        result.footnotes = {};
+        for (const [fnId, fn] of Object.entries(footnotes as Record<string, any>)) {
+          if (fn.content) {
+            result.footnotes[fnId] = { content: extractParagraphs(fn.content, listsMap) };
+          }
+        }
       }
     }
   } else if (includeContent && doc.body?.content) {
     // Legacy path: no tabs in response
-    result.body = { content: extractParagraphs(doc.body.content) };
+    result.body = { content: extractParagraphs(doc.body.content, (doc as any).lists) };
+    // Extract footnotes from legacy path
+    const footnotes = (doc as any).footnotes;
+    if (footnotes) {
+      result.footnotes = {};
+      for (const [fnId, fn] of Object.entries(footnotes as Record<string, any>)) {
+        if (fn.content) {
+          result.footnotes[fnId] = { content: extractParagraphs(fn.content, (doc as any).lists) };
+        }
+      }
+    }
   }
 
   return result;
@@ -217,8 +280,15 @@ export function formatDocumentMarkdown(doc: SimplifiedDocument): string {
         ? `[${para.namedStyleType}] `
         : '';
 
+      const listPrefix = para.listInfo
+        ? `[${para.listInfo.ordered ? 'numbered' : 'bullet'}${para.listInfo.nestingLevel > 0 ? `, L${para.listInfo.nestingLevel}` : ''}] `
+        : '';
+
       // Show formatting annotations inline
       const formattedRuns = para.elements.map(run => {
+        if (run.footnoteId) {
+          return `[footnote:${run.footnoteId}@${run.startIndex}]`;
+        }
         const tags: string[] = [];
         if (run.bold) tags.push('B');
         if (run.italic) tags.push('I');
@@ -233,7 +303,33 @@ export function formatDocumentMarkdown(doc: SimplifiedDocument): string {
         return content;
       }).join('');
 
-      parts.push(`${stylePrefix}(${para.startIndex}-${para.endIndex}) ${formattedRuns}`);
+      parts.push(`${listPrefix}${stylePrefix}(${para.startIndex}-${para.endIndex}) ${formattedRuns}`);
+    }
+  }
+
+  // Render footnote content
+  if (doc.footnotes) {
+    parts.push('');
+    parts.push('## Footnotes');
+    for (const [fnId, fn] of Object.entries(doc.footnotes)) {
+      parts.push('');
+      parts.push(`### Footnote: ${fnId}`);
+      for (const para of fn.content) {
+        if (para.text.trim() === '') continue;
+        const formattedRuns = para.elements.map(run => {
+          const tags: string[] = [];
+          if (run.bold) tags.push('B');
+          if (run.italic) tags.push('I');
+          if (run.underline) tags.push('U');
+          if (run.link) tags.push(`link:${run.link}`);
+          const content = run.content.replace(/\n$/, '');
+          if (tags.length > 0 && content.trim()) {
+            return `[${tags.join(',')}]${content}[/${tags.join(',')}]`;
+          }
+          return content;
+        }).join('');
+        parts.push(`(${para.startIndex}-${para.endIndex}) ${formattedRuns}`);
+      }
     }
   }
 

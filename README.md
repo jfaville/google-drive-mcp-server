@@ -116,6 +116,20 @@ TRANSPORT=stdio npm start
 
 In an MCP client: call `gdrive_authenticate` to get an auth URL, have the user visit it, then pass the code from the redirect URL to `gdrive_set_credentials`.
 
+### Using both modes together
+
+You can run **stdio as the default** (launched by your MCP client) and **spin up HTTP temporarily** when you need the Picker to grant access to existing files:
+
+1. Keep `TRANSPORT=stdio` in your MCP client config (Claude Code `.mcp.json`, Claude Desktop config, etc.)
+2. When you need to access an existing Drive file, start a separate HTTP instance:
+   ```bash
+   GOOGLE_CLIENT_ID="..." GOOGLE_CLIENT_SECRET="..." TRANSPORT=http PORT=3000 node dist/index.js
+   ```
+3. Open `http://localhost:3000`, select files via the Picker, then shut down the HTTP server (`Ctrl-C`).
+4. The stdio instance can now access those files — `drive.file` grants are registered at Google's backend, not per-process.
+
+If you're using Claude Code, there's a bundled `/picker` skill (in `.claude/skills/picker/`) that automates this workflow.
+
 ### Development (hot reload)
 
 ```bash
@@ -311,6 +325,7 @@ Add this as a second entry in the `PreToolUse` array. Write operations (`gdrive_
 - `drive.file` is the least-privileged Drive scope; Google does not require app verification for it
 - The Google Docs API also respects `drive.file` — no additional scope is needed for document editing
 - The server binds only to `localhost` — it is not intended to be exposed to the internet
+- **HTTP mode DNS rebinding protection:** the server validates `Host` and `Origin` headers on all requests, rejecting any that don't match `localhost:PORT` or `127.0.0.1:PORT`. CORS headers are set to restrict cross-origin access. This prevents malicious websites from making requests to the server via DNS rebinding
 - OAuth tokens include a refresh token and are reloaded on restart; delete `.tokens.json` to force re-authentication
 - MIME type and name values in Drive API search queries are single-quote-escaped to prevent query injection
 - HTML responses escape user-supplied values to prevent XSS

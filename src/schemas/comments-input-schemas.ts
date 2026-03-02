@@ -37,7 +37,15 @@ export const AddCommentInputSchema = z.object({
   end_index: z.number().int().min(2).optional()
     .describe('End index (exclusive) of the text to anchor the comment to'),
   quoted_text: z.string().optional()
-    .describe('The exact quoted text being commented on. If start_index/end_index are provided and this is omitted, it will be extracted from the document automatically.')
+    .describe('The exact quoted text being commented on. If start_index/end_index are provided and this is omitted, it will be extracted from the document automatically.'),
+  tab_id: z.string().optional()
+    .describe('Tab ID for multi-tab documents. Required for insert_marker on non-first tabs.'),
+  segment_id: z.string().optional()
+    .describe('Footnote segment ID (e.g. "kix.abc123") for inserting the marker inside footnote text.'),
+  marker_index: z.number().int().min(1).optional()
+    .describe('Index within the segment (footnote) where the [*] marker should be inserted. Use with segment_id and insert_marker.'),
+  insert_marker: z.boolean().default(false)
+    .describe('If true, insert a small blue "[*]" marker. For footnote comments: use with segment_id + marker_index. Requires document_id.')
 }).strict().refine(
   data => {
     const hasAnchorFields = data.start_index !== undefined || data.end_index !== undefined;

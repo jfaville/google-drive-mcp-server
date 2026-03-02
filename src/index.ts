@@ -16,16 +16,6 @@ import { drive_v3 } from 'googleapis';
 import { formatError, formatFileListMarkdown, formatFileMarkdown, truncateText, buildSearchQuery, escapeHtml } from './services/utils.js';
 import { ResponseFormat, GOOGLE_DOC_EXPORT_MIME_TYPES } from './constants.js';
 
-/** Escape a string for safe interpolation into HTML. */
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
 /**
  * Build comment/reply content with optional prefix and anchor quote.
  * Controlled by env vars COMMENT_PREFIX and COMMENT_SHOW_ANCHOR_QUOTE.
@@ -142,12 +132,26 @@ import {
   InsertTableInputSchema,
   InsertPageBreakInputSchema,
   InsertImageInputSchema,
+  InsertFootnoteCommentInputSchema,
 } from './schemas/additional-docs-input-schemas.js';
 import type {
   InsertTableInput,
   InsertPageBreakInput,
   InsertImageInput,
+  InsertFootnoteCommentInput,
 } from './schemas/additional-docs-input-schemas.js';
+import {
+  ListRevisionsInputSchema,
+  GetRevisionInputSchema,
+} from './schemas/revisions-input-schemas.js';
+import type {
+  ListRevisionsInput,
+  GetRevisionInput,
+} from './schemas/revisions-input-schemas.js';
+import {
+  RevisionListOutputSchema,
+  RevisionDetailOutputSchema,
+} from './schemas/revisions-output-schemas.js';
 
 // Initialize MCP server
 const server = new McpServer({
@@ -1852,7 +1856,60 @@ Don't use when: Replying to an existing comment — use gdrive_reply_to_comment 
       });
 
       const comment = mapComment(response.data);
-      const text = `Comment created on file ${params.file_id}\n${formatCommentMarkdown(comment)}`;
+
+      // Optionally insert a visual "[*]" marker in blue at the comment location
+      let markerNote = '';
+      const markerIdx = params.marker_index ?? params.end_index;
+      if (params.insert_marker && params.document_id && markerIdx !== undefined) {
+        try {
+          const docs = docsService.getDocs();
+          const marker = '[*]';
+          const insertIndex = markerIdx;
+
+          const loc: any = { index: insertIndex };
+          if (params.tab_id) loc.tabId = params.tab_id;
+          if (params.segment_id) loc.segmentId = params.segment_id;
+
+          const rangeLoc: any = {
+            startIndex: insertIndex,
+            endIndex: insertIndex + marker.length,
+          };
+          if (params.tab_id) rangeLoc.tabId = params.tab_id;
+          if (params.segment_id) rangeLoc.segmentId = params.segment_id;
+
+          await docs.documents.batchUpdate({
+            documentId: params.document_id,
+            requestBody: {
+              requests: [
+                {
+                  insertText: {
+                    location: loc,
+                    text: marker,
+                  },
+                },
+                {
+                  updateTextStyle: {
+                    textStyle: {
+                      foregroundColor: {
+                        color: { rgbColor: { red: 0.2, green: 0.4, blue: 0.9 } },
+                      },
+                      fontSize: { magnitude: 8, unit: 'PT' },
+                      bold: true,
+                    },
+                    range: rangeLoc,
+                    fields: 'foregroundColor,fontSize,bold',
+                  },
+                },
+              ],
+            },
+          });
+          markerNote = '\n(Visual marker "[*]" inserted at comment location)';
+        } catch (markerError) {
+          markerNote = `\n(Warning: failed to insert visual marker: ${markerError instanceof Error ? markerError.message : String(markerError)})`;
+        }
+      }
+
+      const text = `Comment created on file ${params.file_id}${markerNote}\n${formatCommentMarkdown(comment)}`;
       return { content: [{ type: "text", text }], structuredContent: comment };
     } catch (error) {
       return { content: [{ type: "text", text: formatError(error) }], isError: true };
@@ -2339,6 +2396,278 @@ Note: The image URL must be publicly accessible. Google will fetch the image at 
   }
 );
 
+/**
+ * Tool: gdocs_insert_footnote_comment
+ * Insert a footnote with a styled comment into a Google Doc
+ */
+server.registerTool(
+  "gdocs_insert_footnote_comment",
+  {
+    title: "Insert Footnote Comment in Google Doc",
+    description: `Insert a footnote at a specific position in a Google Doc, populated with a comment. The comment is automatically prefixed with "*Claude:* " in blue text (if COMMENT_PREFIX is set).
+
+This is the preferred way to leave inline feedback on a Google Doc, since it produces a visually anchored footnote marker at the target text. Use gdocs_get_document with include_content=true to find the correct index.
+
+Args:
+  - document_id (string): The Google Doc ID
+  - index (number): 1-based body index where the footnote reference should appear
+  - content (string): The comment text
+
+Note: Footnotes cannot be nested. To comment on text that is already inside a footnote, use gdrive_add_comment instead.`,
+    inputSchema: InsertFootnoteCommentInputSchema,
+    outputSchema: BatchUpdateResultOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async (params: InsertFootnoteCommentInput) => {
+    try {
+      ensureAuthenticated();
+      const docs = docsService.getDocs();
+
+      // Step 1: Create the footnote
+      const createLoc: any = { index: params.index };
+      if (params.tab_id) createLoc.tabId = params.tab_id;
+
+      const createRes = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: {
+          requests: [{ createFootnote: { location: createLoc } }]
+        }
+      });
+
+      // Extract the footnoteId from the reply
+      const footnoteId = (createRes.data.replies as any)?.[0]?.createFootnote?.footnoteId;
+      if (!footnoteId) {
+        return {
+          content: [{ type: "text", text: 'Failed to create footnote: no footnoteId in response' }],
+          isError: true
+        };
+      }
+
+      // Step 2: Build the comment text with optional prefix
+      // Strip markdown bold markers (*) from prefix since we apply real bold in footnotes
+      const rawPrefix = process.env.COMMENT_PREFIX;
+      const prefix = rawPrefix ? rawPrefix.replace(/\*/g, '') : undefined;
+      const commentText = prefix ? `${prefix} ${params.content}` : params.content;
+      const prefixLen = prefix ? prefix.length + 1 : 0; // +1 for the space
+
+      // Step 3: Insert text and style it in the footnote segment
+      // New footnotes start with " \n" (space + newline) at indices 0-1, end index 2.
+      // We insert at index 1 (before \n), then delete the initial space at 0.
+      // After both ops, our text starts at index 0 in the segment.
+      // Note: tabId must be included in all locations/ranges for multi-tab documents.
+      const segLoc: any = { segmentId: footnoteId };
+      if (params.tab_id) segLoc.tabId = params.tab_id;
+
+      const requests: any[] = [
+        {
+          insertText: {
+            location: { ...segLoc, index: 1 },
+            text: commentText,
+          }
+        },
+        // Delete the initial space character (now still at index 0 since we inserted after it)
+        {
+          deleteContentRange: {
+            range: { ...segLoc, startIndex: 0, endIndex: 1 }
+          }
+        },
+      ];
+
+      // Style the prefix in blue if present
+      if (prefix && prefixLen > 0) {
+        requests.push({
+          updateTextStyle: {
+            range: {
+              ...segLoc,
+              startIndex: 0, // after delete, text starts at 0
+              endIndex: prefixLen,
+            },
+            textStyle: {
+              foregroundColor: {
+                color: { rgbColor: { red: 0.2, green: 0.4, blue: 0.9 } }
+              },
+              bold: true,
+            },
+            fields: 'foregroundColor,bold',
+          }
+        });
+      }
+
+      const styleRes = await docs.documents.batchUpdate({
+        documentId: params.document_id,
+        requestBody: { requests }
+      });
+
+      const result: BatchUpdateResult = {
+        documentId: styleRes.data.documentId!,
+        replies: [
+          ...(createRes.data.replies || []),
+          ...(styleRes.data.replies || []),
+        ],
+      };
+      return {
+        content: [{ type: "text", text: `Inserted footnote comment at index ${params.index} in document ${result.documentId}` }],
+        structuredContent: result
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+// ─── Google Drive Revisions Tools ───
+
+/**
+ * Tool: gdrive_list_revisions
+ * List revisions (version history) of a Google Drive file.
+ */
+server.registerTool(
+  "gdrive_list_revisions",
+  {
+    title: "List File Revisions",
+    description: "List revisions (version history) of a Google Drive file. Due to the drive.file scope, only files created by this app or opened via the Picker are accessible. Note: Google may merge older revisions, so the list may not contain every individual edit.",
+    inputSchema: ListRevisionsInputSchema,
+    outputSchema: RevisionListOutputSchema,
+    annotations: { title: "List File Revisions", readOnlyHint: true, openWorldHint: false },
+  },
+  async (params: ListRevisionsInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const res = await drive.revisions.list({
+        fileId: params.file_id,
+        pageSize: params.page_size,
+        pageToken: params.page_token,
+        fields: 'nextPageToken,revisions(id,modifiedTime,lastModifyingUser,size)',
+      });
+
+      const revisions = (res.data.revisions || []).map((rev: drive_v3.Schema$Revision) => ({
+        id: rev.id!,
+        modifiedTime: rev.modifiedTime || undefined,
+        lastModifyingUser: rev.lastModifyingUser?.displayName || undefined,
+        lastModifyingEmail: rev.lastModifyingUser?.emailAddress || undefined,
+        size: rev.size || undefined,
+      }));
+
+      const result = {
+        count: revisions.length,
+        revisions,
+        has_more: !!res.data.nextPageToken,
+        next_page_token: res.data.nextPageToken || undefined,
+      };
+
+      const lines = revisions.map((r: { id: string; modifiedTime?: string; lastModifyingUser?: string; lastModifyingEmail?: string; size?: string }) =>
+        `- **Rev ${r.id}** | ${r.modifiedTime || 'unknown time'} | ${r.lastModifyingUser || r.lastModifyingEmail || 'unknown user'}${r.size ? ` | ${r.size} bytes` : ''}`
+      );
+      const md = `## Revisions (${result.count})\n\n${lines.join('\n')}${result.has_more ? '\n\n_More results available — use next_page_token._' : ''}`;
+
+      return { content: [{ type: "text" as const, text: md }], structuredContent: result };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: formatError(error) }], isError: true };
+    }
+  }
+);
+
+/**
+ * Tool: gdrive_get_revision
+ * Get metadata and optionally text content of a specific file revision.
+ */
+server.registerTool(
+  "gdrive_get_revision",
+  {
+    title: "Get File Revision",
+    description: "Retrieve metadata and optionally the text content of a specific revision of a Google Drive file. For Google Workspace files (Docs, Sheets, Slides), content is exported as plain text. For binary files, content export is not available.",
+    inputSchema: GetRevisionInputSchema,
+    outputSchema: RevisionDetailOutputSchema,
+    annotations: { title: "Get File Revision", readOnlyHint: true, openWorldHint: false },
+  },
+  async (params: GetRevisionInput) => {
+    try {
+      ensureAuthenticated();
+      const drive = driveService.getDrive();
+
+      const res = await drive.revisions.get({
+        fileId: params.file_id,
+        revisionId: params.revision_id,
+        fields: 'id,mimeType,modifiedTime,lastModifyingUser,size',
+      });
+
+      const rev = res.data;
+      const result: Record<string, unknown> = {
+        id: rev.id!,
+        modifiedTime: rev.modifiedTime || undefined,
+        lastModifyingUser: rev.lastModifyingUser?.displayName || undefined,
+        lastModifyingEmail: rev.lastModifyingUser?.emailAddress || undefined,
+        size: rev.size || undefined,
+        mimeType: rev.mimeType || undefined,
+      };
+
+      // Optionally export content as plain text
+      if (params.include_content) {
+        const mimeType = rev.mimeType || '';
+        const isGoogleWorkspace = mimeType.startsWith('application/vnd.google-apps.');
+
+        if (isGoogleWorkspace) {
+          // Export Google Workspace files as plain text
+          const exportRes = await drive.revisions.get({
+            fileId: params.file_id,
+            revisionId: params.revision_id,
+            alt: 'media',
+          }, {
+            // For Google Workspace files we need to export via files.export instead
+            // revisions.get with alt=media doesn't work for Workspace files
+          });
+          // Fall back to files.export approach — get the file's export link
+          try {
+            const exportMime = 'text/plain';
+            const exportResult = await drive.files.export({
+              fileId: params.file_id,
+              mimeType: exportMime,
+            }, { responseType: 'text' });
+            result.content = truncateText(String(exportResult.data), 50000);
+          } catch {
+            result.content = '(Could not export revision content — export may not be available for this file type or revision)';
+          }
+        } else {
+          // For non-Workspace files, try to download revision content directly
+          try {
+            const dlRes = await drive.revisions.get({
+              fileId: params.file_id,
+              revisionId: params.revision_id,
+              alt: 'media',
+            }, { responseType: 'text' });
+            result.content = truncateText(String(dlRes.data), 50000);
+          } catch {
+            result.content = '(Could not download revision content)';
+          }
+        }
+      }
+
+      const lines = [
+        `**Revision ${result.id}**`,
+        result.modifiedTime ? `Modified: ${result.modifiedTime}` : null,
+        result.lastModifyingUser ? `By: ${result.lastModifyingUser}` : (result.lastModifyingEmail ? `By: ${result.lastModifyingEmail}` : null),
+        result.mimeType ? `Type: ${result.mimeType}` : null,
+        result.size ? `Size: ${result.size} bytes` : null,
+      ].filter(Boolean).join('\n');
+
+      const md = result.content
+        ? `${lines}\n\n---\n\n${result.content}`
+        : lines;
+
+      return { content: [{ type: "text" as const, text: md }], structuredContent: result };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: formatError(error) }], isError: true };
+    }
+  }
+);
+
 // Transport setup functions
 async function runStdio() {
   const transport = new StdioServerTransport();
@@ -2349,6 +2678,33 @@ async function runStdio() {
 async function runHTTP() {
   const app = express();
   app.use(express.json());
+
+  // --- Host validation (DNS rebinding protection) ---
+  const allowedHosts = new Set([
+    `localhost:${port}`, `127.0.0.1:${port}`,
+    'localhost', '127.0.0.1'
+  ]);
+
+  app.use((req, res, next) => {
+    const host = req.headers.host;
+    if (host && !allowedHosts.has(host)) {
+      console.error(`Blocked request with invalid Host header: ${host}`);
+      res.status(403).json({ error: 'Forbidden: invalid host' });
+      return;
+    }
+
+    // CORS: only allow same-origin requests
+    res.setHeader('Access-Control-Allow-Origin', `http://localhost:${port}`);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+
+    next();
+  });
 
   // --- Rate limiting (per-IP, in-memory) ---
   const rateLimitWindow = 60_000; // 1 minute

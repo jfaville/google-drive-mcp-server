@@ -55,3 +55,15 @@ export const InsertImageInputSchema = z.object({
 );
 
 export type InsertImageInput = z.infer<typeof InsertImageInputSchema>;
+
+export const InsertFootnoteCommentInputSchema = z.object({
+  document_id: z.string().min(1).describe('The Google Doc ID'),
+  index: z.number().int().min(1)
+    .describe('1-based body index where the footnote reference should appear'),
+  content: z.string().min(1)
+    .describe('The comment text to insert into the footnote'),
+  tab_id: z.string().optional()
+    .describe('Tab ID to insert into. If omitted, inserts into the first tab.'),
+}).strict();
+
+export type InsertFootnoteCommentInput = z.infer<typeof InsertFootnoteCommentInputSchema>;

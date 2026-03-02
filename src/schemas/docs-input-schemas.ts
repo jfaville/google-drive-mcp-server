@@ -106,7 +106,7 @@ export const UpdateTextStyleInputSchema = z.object({
   background_color: RgbColorSchema.optional()
     .describe('Text highlight color as RGB (each 0-1)'),
   link_url: z.string().url().optional()
-    .describe('URL to link the text to')
+    .describe('URL to link the text to'),
 }).strict().refine(
   data => data.end_index > data.start_index,
   { message: 'end_index must be greater than start_index' }
