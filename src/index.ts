@@ -1621,6 +1621,7 @@ Args:
     - updateTextStyle: { textStyle: {...}, range: { startIndex, endIndex, segmentId }, fields: "bold,italic,..." }
     - replaceAllText: { containsText: { text, matchCase }, replaceText }
     - updateParagraphStyle: { paragraphStyle: {...}, range: { startIndex, endIndex, segmentId }, fields: "namedStyleType,..." }
+    - createParagraphBullets: { range: { startIndex, endIndex, segmentId }, bulletPreset: "NUMBERED_DECIMAL_ALPHA_ROMAN" | "BULLET_DISC_CIRCLE_SQUARE" | ... }
 
 Important: Operations are applied in order. insertText and deleteContentRange shift indices — account for this when combining operations. When deleting and inserting, process from end-of-document to start to avoid index shifts affecting subsequent operations.`,
     inputSchema: BatchUpdateInputSchema,

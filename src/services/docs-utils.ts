@@ -34,6 +34,8 @@ export interface SimplifiedTextRun {
   fontFamily?: string;
   link?: string;
   footnoteId?: string;
+  suggestedInsertion?: boolean;
+  suggestedDeletion?: boolean;
 }
 
 /** Simplified tab info */
@@ -134,6 +136,11 @@ function extractParagraphs(content: docs_v1.Schema$StructuralElement[], lists?: 
           if (style.fontSize?.magnitude) run.fontSize = style.fontSize.magnitude;
           if (style.weightedFontFamily?.fontFamily) run.fontFamily = style.weightedFontFamily.fontFamily;
           if (style.link?.url) run.link = style.link.url;
+
+          // Track suggested changes (visible when suggestionsViewMode = SUGGESTIONS_INLINE)
+          const elAny = el as any;
+          if (elAny.textRun?.suggestedInsertionIds?.length > 0) run.suggestedInsertion = true;
+          if (elAny.textRun?.suggestedDeletionIds?.length > 0) run.suggestedDeletion = true;
 
           textRuns.push(run);
           fullText += el.textRun.content || '';
@@ -290,6 +297,8 @@ export function formatDocumentMarkdown(doc: SimplifiedDocument): string {
           return `[footnote:${run.footnoteId}@${run.startIndex}]`;
         }
         const tags: string[] = [];
+        if (run.suggestedInsertion) tags.push('+');
+        if (run.suggestedDeletion) tags.push('-');
         if (run.bold) tags.push('B');
         if (run.italic) tags.push('I');
         if (run.underline) tags.push('U');

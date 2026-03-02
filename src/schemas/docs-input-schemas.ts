@@ -200,6 +200,31 @@ const BatchRequestSchema = z.object({
       tabId: z.string().optional()
     }),
     fields: z.string().min(1)
+  }).optional(),
+  createParagraphBullets: z.object({
+    range: z.object({
+      startIndex: z.number().int().min(1),
+      endIndex: z.number().int().min(2),
+      segmentId: z.string().default(''),
+      tabId: z.string().optional()
+    }),
+    bulletPreset: z.enum([
+      'BULLET_DISC_CIRCLE_SQUARE',
+      'BULLET_DIAMONDX_ARROW3D_SQUARE',
+      'BULLET_CHECKBOX',
+      'BULLET_ARROW_DIAMOND_DISC',
+      'BULLET_STAR_CIRCLE_SQUARE',
+      'BULLET_ARROW3D_CIRCLE_SQUARE',
+      'BULLET_LEFTTRIANGLE_DIAMOND_DISC',
+      'BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE',
+      'BULLET_DIAMOND_CIRCLE_SQUARE',
+      'NUMBERED_DECIMAL_ALPHA_ROMAN',
+      'NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS',
+      'NUMBERED_DECIMAL_NESTED',
+      'NUMBERED_UPPERALPHA_ALPHA_ROMAN',
+      'NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL',
+      'NUMBERED_ZERODECIMAL_ALPHA_ROMAN'
+    ])
   }).optional()
 }).strict();
 
