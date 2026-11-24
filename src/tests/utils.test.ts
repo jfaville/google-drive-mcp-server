@@ -33,6 +33,17 @@ describe('buildSearchQuery', () => {
     assert.ok(!q.includes("text/plain'; trashed=false"), `Unescaped value present: ${q}`);
   });
 
+  it('escapes backslashes in query', () => {
+    const q = buildSearchQuery({ query: 'notes\\' });
+    assert.ok(q.includes("name contains 'notes\\\\'"), `Got: ${q}`);
+  });
+
+  it('escapes a backslash before a single quote', () => {
+    // "x\'" must not turn into 'x\\' (escaped backslash, then a closing quote)
+    const q = buildSearchQuery({ query: "x\\' or trashed=true" });
+    assert.ok(q.includes("name contains 'x\\\\\\' or trashed=true'"), `Got: ${q}`);
+  });
+
   it('includes mimeType filter', () => {
     const q = buildSearchQuery({ mime_type: 'application/vnd.google-apps.folder' });
     assert.ok(q.includes("mimeType='application/vnd.google-apps.folder'"));

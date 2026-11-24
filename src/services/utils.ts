@@ -127,6 +127,15 @@ export function escapeHtml(value: unknown): string {
 }
 
 /**
+ * Escape a value for use inside a single-quoted Drive query string.
+ * Backslashes must be escaped before quotes, otherwise a trailing backslash
+ * escapes the closing quote: https://developers.google.com/drive/api/guides/ref-search-terms
+ */
+function escapeQueryValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+/**
  * Build a Google Drive API search query
  */
 export function buildSearchQuery(params: {
@@ -138,15 +147,15 @@ export function buildSearchQuery(params: {
   const conditions: string[] = [];
   
   if (params.mime_type) {
-    conditions.push(`mimeType='${params.mime_type.replace(/'/g, "\\'")}'`);
+    conditions.push(`mimeType='${escapeQueryValue(params.mime_type)}'`);
   }
   
   if (params.parent_id) {
-    conditions.push(`'${params.parent_id.replace(/'/g, "\\'")}' in parents`);
+    conditions.push(`'${escapeQueryValue(params.parent_id)}' in parents`);
   }
   
   if (params.query) {
-    conditions.push(`name contains '${params.query.replace(/'/g, "\\'")}'`);
+    conditions.push(`name contains '${escapeQueryValue(params.query)}'`);
   }
   
   if (params.trashed !== undefined) {
